@@ -36,15 +36,17 @@ jobs:
           ref: ${{ github.event.inputs.target_branch || 'main' }}
 
       - name: Add upstream remote
+        env:
+          UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'microsoft/agent-framework' }}
         run: |
-          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo || 'microsoft/agent-framework' }}"
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream
 
       - name: Check if sync is needed
         id: check
+        env:
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
         run: |
-          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || 'main' }}"
           LOCAL_SHA="$(git rev-parse HEAD)"
           UPSTREAM_SHA="$(git rev-parse upstream/${UPSTREAM_BRANCH})"
           echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
@@ -62,9 +64,10 @@ jobs:
 
       - name: Fast-forward to upstream
         if: steps.check.outputs.up_to_date == 'false'
+        env:
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
         run: |
-          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || 'main' }}"
-          TARGET_BRANCH="${{ github.event.inputs.target_branch || 'main' }}"
           git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
           git push origin "${TARGET_BRANCH}"
 
