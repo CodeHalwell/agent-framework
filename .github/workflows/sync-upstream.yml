@@ -1,0 +1,75 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # Daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repository to sync from (owner/repo)'
+        required: false
+        default: 'microsoft/agent-framework'
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: false
+        default: 'main'
+      target_branch:
+        description: 'Local branch to update'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync fork with upstream
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.target_branch || 'main' }}
+
+      - name: Add upstream remote
+        run: |
+          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo || 'microsoft/agent-framework' }}"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream
+
+      - name: Check if sync is needed
+        id: check
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || 'main' }}"
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          UPSTREAM_SHA="$(git rev-parse upstream/${UPSTREAM_BRANCH})"
+          echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          if [ "${LOCAL_SHA}" = "${UPSTREAM_SHA}" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
+          elif git merge-base --is-ancestor "${LOCAL_SHA}" "${UPSTREAM_SHA}"; then
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "Fast-forward possible: ${LOCAL_SHA} -> ${UPSTREAM_SHA}"
+          else
+            echo "up_to_date=diverged" >> "$GITHUB_OUTPUT"
+            echo "Branches have diverged; cannot fast-forward."
+          fi
+
+      - name: Fast-forward to upstream
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch || 'main' }}"
+          TARGET_BRANCH="${{ github.event.inputs.target_branch || 'main' }}"
+          git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
+          git push origin "${TARGET_BRANCH}"
+
+      - name: Fail when branches have diverged
+        if: steps.check.outputs.up_to_date == 'diverged'
+        run: |
+          echo "::error::Local branch has commits not present upstream. Resolve manually or reset the branch."
+          exit 1
