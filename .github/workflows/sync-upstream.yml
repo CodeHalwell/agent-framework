@@ -51,19 +51,26 @@ jobs:
           UPSTREAM_SHA="$(git rev-parse upstream/${UPSTREAM_BRANCH})"
           echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          # `mode` is one of: up-to-date | fast-forward | merge.
+          #
+          # Fork-local commits (this workflow file among them) live on the
+          # target branch, so the branch is permanently *not* an ancestor of
+          # upstream and a fast-forward can never apply again. That is the
+          # ordinary steady state for a fork that carries anything of its own,
+          # not an error — so it merges rather than failing.
           if [ "${LOCAL_SHA}" = "${UPSTREAM_SHA}" ]; then
-            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "mode=up-to-date" >> "$GITHUB_OUTPUT"
             echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
           elif git merge-base --is-ancestor "${LOCAL_SHA}" "${UPSTREAM_SHA}"; then
-            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+            echo "mode=fast-forward" >> "$GITHUB_OUTPUT"
             echo "Fast-forward possible: ${LOCAL_SHA} -> ${UPSTREAM_SHA}"
           else
-            echo "up_to_date=diverged" >> "$GITHUB_OUTPUT"
-            echo "Branches have diverged; cannot fast-forward."
+            echo "mode=merge" >> "$GITHUB_OUTPUT"
+            echo "Local branch carries commits of its own; merging upstream in."
           fi
 
       - name: Fast-forward to upstream
-        if: steps.check.outputs.up_to_date == 'false'
+        if: steps.check.outputs.mode == 'fast-forward'
         env:
           UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
@@ -71,8 +78,23 @@ jobs:
           git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
           git push origin "${TARGET_BRANCH}"
 
-      - name: Fail when branches have diverged
-        if: steps.check.outputs.up_to_date == 'diverged'
+      - name: Merge upstream into the fork
+        if: steps.check.outputs.mode == 'merge'
+        env:
+          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+          TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
         run: |
-          echo "::error::Local branch has commits not present upstream. Resolve manually or reset the branch."
-          exit 1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # A conflict is the one case a human is genuinely needed for: it means
+          # upstream and the fork changed the same lines. Abort so the branch is
+          # left untouched, and report which paths collided.
+          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "::error::Merge conflict with upstream/${UPSTREAM_BRANCH}; resolve manually."
+            git diff --name-only --diff-filter=U | sed 's/^/  conflicted: /'
+            git merge --abort
+            exit 1
+          fi
+
+          git push origin "${TARGET_BRANCH}"
