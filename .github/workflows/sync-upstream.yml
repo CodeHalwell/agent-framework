@@ -1,26 +1,39 @@
 name: Sync with upstream
 
+# Keeps this fork's main level with microsoft/agent-framework.
+#
+# The sync goes through the fork-sync API (`POST /repos/{owner}/{repo}/
+# merge-upstream`) rather than a git merge and push, because GITHUB_TOKEN
+# cannot push a commit that touches `.github/workflows/**` — the `workflow`
+# scope that permits it exists only on PATs and GitHub Apps, and there is no
+# `permissions:` key that grants it to GITHUB_TOKEN. That is what broke the
+# scheduled sync on 2026-08-21..24, whenever upstream touched a workflow
+# file. (Declaring `workflows: write` in `permissions:` then made things
+# worse: it is not a valid permission key, so the file itself became invalid
+# and every run failed at startup, scheduled runs included.)
+#
+# `merge-upstream` is what the repository's own "Sync fork" button calls. The
+# merge happens server-side, on the repository's behalf rather than as a
+# token push, so workflow files come across like any other file.
+#
+# The endpoint syncs a branch of this fork from the *parent* repository's
+# branch of the same name, which is why there are no upstream_repo /
+# upstream_branch inputs any more: they had nowhere to go. Syncing from
+# somewhere other than microsoft/agent-framework:main means changing the
+# fork's parent, not this file.
+
 on:
   schedule:
     - cron: '0 6 * * *' # Daily at 06:00 UTC
   workflow_dispatch:
     inputs:
-      upstream_repo:
-        description: 'Upstream repository to sync from (owner/repo)'
-        required: false
-        default: 'microsoft/agent-framework'
-      upstream_branch:
-        description: 'Upstream branch to sync from'
-        required: false
-        default: 'main'
       target_branch:
-        description: 'Local branch to update'
+        description: 'Branch of this fork to update (synced from the parent repo branch of the same name)'
         required: false
         default: 'main'
 
 permissions:
   contents: write
-  workflows: write
 
 concurrency:
   group: sync-upstream
@@ -31,71 +44,37 @@ jobs:
     name: Sync fork with upstream
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          ref: ${{ github.event.inputs.target_branch || 'main' }}
-
-      - name: Add upstream remote
+      - name: Sync from upstream
         env:
-          UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'microsoft/agent-framework' }}
-        run: |
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch upstream
-
-      - name: Check if sync is needed
-        id: check
-        env:
-          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
-        run: |
-          LOCAL_SHA="$(git rev-parse HEAD)"
-          UPSTREAM_SHA="$(git rev-parse upstream/${UPSTREAM_BRANCH})"
-          echo "local_sha=${LOCAL_SHA}" >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
-          # `mode` is one of: up-to-date | fast-forward | merge.
-          #
-          # Fork-local commits (this workflow file among them) live on the
-          # target branch, so the branch is permanently *not* an ancestor of
-          # upstream and a fast-forward can never apply again. That is the
-          # ordinary steady state for a fork that carries anything of its own,
-          # not an error — so it merges rather than failing.
-          if [ "${LOCAL_SHA}" = "${UPSTREAM_SHA}" ]; then
-            echo "mode=up-to-date" >> "$GITHUB_OUTPUT"
-            echo "Already up to date with upstream/${UPSTREAM_BRANCH}."
-          elif git merge-base --is-ancestor "${LOCAL_SHA}" "${UPSTREAM_SHA}"; then
-            echo "mode=fast-forward" >> "$GITHUB_OUTPUT"
-            echo "Fast-forward possible: ${LOCAL_SHA} -> ${UPSTREAM_SHA}"
-          else
-            echo "mode=merge" >> "$GITHUB_OUTPUT"
-            echo "Local branch carries commits of its own; merging upstream in."
-          fi
-
-      - name: Fast-forward to upstream
-        if: steps.check.outputs.mode == 'fast-forward'
-        env:
-          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
         run: |
-          git merge --ff-only "upstream/${UPSTREAM_BRANCH}"
-          git push origin "${TARGET_BRANCH}"
+          set -euo pipefail
 
-      - name: Merge upstream into the fork
-        if: steps.check.outputs.mode == 'merge'
-        env:
-          UPSTREAM_BRANCH: ${{ github.event.inputs.upstream_branch || 'main' }}
-          TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 409 is the one case a human is genuinely needed for: upstream and
+          # the fork changed the same lines. Anything else non-2xx is a real
+          # failure too, so the body is reported either way and the step fails
+          # rather than passing quietly on a sync that did not happen.
+          status=0
+          response="$(gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${REPO}/merge-upstream" \
+            -f "branch=${TARGET_BRANCH}" 2>&1)" || status=$?
 
-          # A conflict is the one case a human is genuinely needed for: it means
-          # upstream and the fork changed the same lines. Abort so the branch is
-          # left untouched, and report which paths collided.
-          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
-            echo "::error::Merge conflict with upstream/${UPSTREAM_BRANCH}; resolve manually."
-            git diff --name-only --diff-filter=U | sed 's/^/  conflicted: /'
-            git merge --abort
+          echo "${response}"
+
+          if [ "${status}" -ne 0 ]; then
+            if printf '%s' "${response}" | grep -q 'HTTP 409'; then
+              echo "::error::Merge conflict syncing ${TARGET_BRANCH} from upstream; resolve manually (GitHub's Sync fork button reports the same conflict)."
+            else
+              echo "::error::Failed to sync ${TARGET_BRANCH} from upstream."
+            fi
             exit 1
           fi
 
-          git push origin "${TARGET_BRANCH}"
+          # merge_type is one of: merge | fast-forward | none.
+          merge_type="$(printf '%s' "${response}" | jq -r '.merge_type // "unknown"')"
+          echo "merge_type=${merge_type}"
+          echo "Synced ${TARGET_BRANCH} from upstream (${merge_type})." >> "$GITHUB_STEP_SUMMARY"
