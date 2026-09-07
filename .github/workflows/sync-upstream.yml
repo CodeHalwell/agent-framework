@@ -2,25 +2,47 @@ name: Sync with upstream
 
 # Keeps this fork's main level with microsoft/agent-framework.
 #
-# The sync goes through the fork-sync API (`POST /repos/{owner}/{repo}/
-# merge-upstream`) rather than a git merge and push, because GITHUB_TOKEN
-# cannot push a commit that touches `.github/workflows/**` — the `workflow`
-# scope that permits it exists only on PATs and GitHub Apps, and there is no
-# `permissions:` key that grants it to GITHUB_TOKEN. That is what broke the
-# scheduled sync on 2026-08-21..24, whenever upstream touched a workflow
-# file. (Declaring `workflows: write` in `permissions:` then made things
-# worse: it is not a valid permission key, so the file itself became invalid
-# and every run failed at startup, scheduled runs included.)
+# ## Why this is not just "Sync fork"
 #
-# `merge-upstream` is what the repository's own "Sync fork" button calls. The
-# merge happens server-side, on the repository's behalf rather than as a
-# token push, so workflow files come across like any other file.
+# GitHub refuses to let GITHUB_TOKEN create or update a file under
+# `.github/workflows/**`. The `workflow` scope that permits it exists only on
+# PATs and GitHub Apps, and there is no `permissions:` key that grants it to
+# GITHUB_TOKEN (declaring `workflows: write` makes the workflow file itself
+# invalid, which is how the 2026-08-29 attempt broke every run at startup).
 #
-# The endpoint syncs a branch of this fork from the *parent* repository's
-# branch of the same name, which is why there are no upstream_repo /
-# upstream_branch inputs any more: they had nowhere to go. Syncing from
-# somewhere other than microsoft/agent-framework:main means changing the
-# fork's parent, not this file.
+# The 2026-08-31 attempt moved the sync onto the fork-sync API
+# (`POST /repos/{owner}/{repo}/merge-upstream`, what the repository's own
+# "Sync fork" button calls) on the assumption that a server-side merge would
+# sidestep the restriction. It does not — the endpoint applies the identical
+# rule, and every scheduled run since has failed with:
+#
+#     refusing to allow a GitHub App to create or update workflow
+#     `.github/workflows/codeql-analysis.yml` without `workflows` permission
+#
+# Upstream touches a workflow file often enough that this is not a rare case:
+# once one such commit is in the window, *every* subsequent run fails on it and
+# the mirror stops advancing entirely, which is what happened from 2026-08-31
+# to 2026-09-07.
+#
+# ## What this does instead
+#
+# The sync is a plain git merge, and the push is made not to contain any change
+# under `.github/workflows/**`: after merging, that directory is restored to
+# the fork's own version, so the ref update GITHUB_TOKEN pushes touches no
+# workflow file and the restriction never applies. Upstream's history is still
+# merged in full — only the workflow *files* keep the fork's contents.
+#
+# This mirror exists to give the `agent-framework-rs` port an up-to-date view
+# of upstream's **source**, so freezing upstream's CI definitions costs that
+# consumer nothing, and it is the only mode that works on GITHUB_TOKEN alone.
+#
+# ## Getting workflow files too
+#
+# Add a repository secret named `SYNC_PAT` holding a fine-grained or classic
+# PAT with the `workflow` scope on this repository. When it is present the
+# workflow uses it, the exclusion above is dropped, and upstream's workflow
+# files come across like any other file. Everything else is unchanged, so
+# adding or removing the secret needs no edit here.
 
 on:
   schedule:
@@ -28,7 +50,7 @@ on:
   workflow_dispatch:
     inputs:
       target_branch:
-        description: 'Branch of this fork to update (synced from the parent repo branch of the same name)'
+        description: 'Branch of this fork to update (merged from the parent repo branch of the same name)'
         required: false
         default: 'main'
 
@@ -46,35 +68,98 @@ jobs:
     steps:
       - name: Sync from upstream
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # SYNC_PAT wins when set; GITHUB_TOKEN is the always-available
+          # fallback that cannot carry workflow-file changes.
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
         run: |
           set -euo pipefail
 
-          # 409 is the one case a human is genuinely needed for: upstream and
-          # the fork changed the same lines. Anything else non-2xx is a real
-          # failure too, so the body is reported either way and the step fails
-          # rather than passing quietly on a sync that did not happen.
-          status=0
-          response="$(gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "repos/${REPO}/merge-upstream" \
-            -f "branch=${TARGET_BRANCH}" 2>&1)" || status=$?
+          if [ -n "${SYNC_PAT}" ]; then
+            token="${SYNC_PAT}"
+            keep_fork_workflows=false
+            echo "Auth: SYNC_PAT (workflow files will be synced)."
+          else
+            token="${GITHUB_TOKEN}"
+            keep_fork_workflows=true
+            echo "Auth: GITHUB_TOKEN (workflow files will keep this fork's contents)."
+          fi
 
-          echo "${response}"
+          # The parent is read off this repository rather than hard-coded, so
+          # re-pointing the fork needs no edit here.
+          upstream_url="$(GH_TOKEN="${token}" gh api "repos/${REPO}" --jq '.parent.clone_url')"
+          if [ -z "${upstream_url}" ] || [ "${upstream_url}" = "null" ]; then
+            echo "::error::${REPO} has no parent repository to sync from."
+            exit 1
+          fi
+          echo "Upstream: ${upstream_url}"
 
-          if [ "${status}" -ne 0 ]; then
-            if printf '%s' "${response}" | grep -q 'HTTP 409'; then
-              echo "::error::Merge conflict syncing ${TARGET_BRANCH} from upstream; resolve manually (GitHub's Sync fork button reports the same conflict)."
-            else
-              echo "::error::Failed to sync ${TARGET_BRANCH} from upstream."
+          git init -q .
+          # Kept out of the remote URL so it is not recorded in the merge
+          # commit's reflog or printed by any later git command.
+          auth_header="$(printf 'x-access-token:%s' "${token}" | base64 -w0)"
+          git config --local "http.${SERVER_URL}/.extraheader" "AUTHORIZATION: basic ${auth_header}"
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add origin "${SERVER_URL}/${REPO}.git"
+          git fetch --no-tags --quiet origin "${TARGET_BRANCH}"
+          git checkout -q -B "${TARGET_BRANCH}" FETCH_HEAD
+
+          git fetch --no-tags --quiet "${upstream_url}" "${TARGET_BRANCH}"
+          upstream_head="$(git rev-parse FETCH_HEAD)"
+
+          if git merge-base --is-ancestor "${upstream_head}" HEAD; then
+            echo "Already up to date with upstream (${upstream_head})."
+            echo "Already up to date with upstream (\`${upstream_head}\`)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          merge_status=0
+          git merge --no-commit --no-ff "${upstream_head}" || merge_status=$?
+
+          if [ "${keep_fork_workflows}" = "true" ]; then
+            # Drop upstream's version of every workflow path — including any
+            # file it added and any conflict it raised — and reinstate the
+            # fork's. HEAD is still the pre-merge commit during a --no-commit
+            # merge, so this stages exactly what the fork already has, leaving
+            # the pushed diff empty under this path.
+            git rm -r -q -f --cached --ignore-unmatch .github/workflows > /dev/null
+            rm -rf .github/workflows
+            # Restoring is conditional only so that a fork with no workflows of
+            # its own leaves upstream's dropped rather than erroring out.
+            if git rev-parse --verify -q "HEAD:.github/workflows" > /dev/null; then
+              git checkout HEAD -- .github/workflows
             fi
+          fi
+
+          # Anything still unmerged is a real content conflict a human has to
+          # settle; failing here is the same signal the old 409 branch gave.
+          if git ls-files --unmerged | awk '{print $4}' | sort -u | grep .; then
+            echo "::error::Merge conflict syncing ${TARGET_BRANCH} from upstream (conflicting paths listed above); resolve manually."
             exit 1
           fi
 
-          # merge_type is one of: merge | fast-forward | none.
-          merge_type="$(printf '%s' "${response}" | jq -r '.merge_type // "unknown"')"
-          echo "merge_type=${merge_type}"
-          echo "Synced ${TARGET_BRANCH} from upstream (${merge_type})." >> "$GITHUB_STEP_SUMMARY"
+          if [ "${merge_status}" -ne 0 ] && [ ! -f .git/MERGE_HEAD ]; then
+            echo "::error::git merge failed (exit ${merge_status}) without leaving a merge to complete."
+            exit 1
+          fi
+
+          if git diff --cached --quiet && [ ! -f .git/MERGE_HEAD ]; then
+            echo "Nothing to merge."
+            exit 0
+          fi
+
+          git commit -q --no-edit
+          git push --quiet origin "HEAD:refs/heads/${TARGET_BRANCH}"
+
+          {
+            echo "Merged upstream \`${upstream_head}\` into \`${TARGET_BRANCH}\`."
+            if [ "${keep_fork_workflows}" = "true" ]; then
+              echo
+              echo "\`.github/workflows/**\` kept this fork's contents — GITHUB_TOKEN may not push workflow-file changes. Add a \`SYNC_PAT\` secret with the \`workflow\` scope to sync them too."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
