@@ -101,6 +101,11 @@ jobs:
           # Kept out of the remote URL so it is not recorded in the merge
           # commit's reflog or printed by any later git command.
           auth_header="$(printf 'x-access-token:%s' "${token}" | base64 -w0)"
+          # Actions redacts the secret's own value, but this is a *derived*
+          # string, so that redaction does not cover it — and git is happy to
+          # echo an extraheader back in verbose or error output. Register it
+          # explicitly before it is ever used.
+          echo "::add-mask::${auth_header}"
           git config --local "http.${SERVER_URL}/.extraheader" "AUTHORIZATION: basic ${auth_header}"
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
