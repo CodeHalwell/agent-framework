@@ -1,5 +1,7 @@
 # Copyright (c) Microsoft. All rights reserved.
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import copy
@@ -19,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from agent_framework import (
     Agent,
+    AgentTriggeredCompactionStrategy,
     Annotation,
     ChatOptions,
     ChatResponse,
@@ -34,6 +37,7 @@ from agent_framework import (
     SupportsMCPTool,
     SupportsWebSearchTool,
     TextSpanRegion,
+    TruncationStrategy,
     WorkflowBuilder,
     tool,
 )
@@ -84,7 +88,13 @@ from openai.types.responses.response_text_done_event import ResponseTextDoneEven
 from pydantic import BaseModel
 from pytest import param
 
-from agent_framework_openai import OpenAIChatClient, OpenAIChatOptions, RawOpenAIChatClient
+from agent_framework_openai import (
+    OpenAIChatClient,
+    OpenAIChatCompletionClient,
+    OpenAIChatOptions,
+    RawOpenAIChatClient,
+    RawOpenAIChatCompletionClient,
+)
 from agent_framework_openai._chat_client import OPENAI_LOCAL_SHELL_CALL_ITEM_ID_KEY
 from agent_framework_openai._exceptions import OpenAIContentFilterException
 
@@ -96,11 +106,80 @@ skip_if_openai_integration_tests_disabled = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    ("option_name", "option_value"),
+    [
+        ("previous_response_id", "resp_existing"),
+        ("conversation", "conv_existing"),
+    ],
+)
+async def test_agent_triggered_compaction_rejects_native_service_continuation_aliases(
+    stream: bool,
+    option_name: str,
+    option_value: str,
+) -> None:
+    client = OpenAIChatClient(model="test-model", api_key="test-key")
+    strategy = AgentTriggeredCompactionStrategy(TruncationStrategy(max_n=2, compact_to=1))
+    options = cast(OpenAIChatOptions, {"store": False, option_name: option_value})
+
+    with pytest.raises(ChatClientInvalidRequestException, match="service-managed continuation"):
+        if stream:
+            response_stream = client.get_response(
+                [Message(role="user", contents=["Hello"])],
+                stream=True,
+                options=options,
+                compaction_strategy=strategy,
+            )
+            async for _ in response_stream:
+                pass
+        else:
+            response = client.get_response(
+                [Message(role="user", contents=["Hello"])],
+                stream=False,
+                options=options,
+                compaction_strategy=strategy,
+            )
+            _ = await response
+
+
 class OutputStruct(BaseModel):
     """A structured output for testing purposes."""
 
     location: str
     weather: str | None = None
+
+
+@pytest.mark.parametrize(
+    "client_type", [RawOpenAIChatClient, OpenAIChatClient, RawOpenAIChatCompletionClient, OpenAIChatCompletionClient]
+)
+@pytest.mark.parametrize("azure", [False, True])
+@pytest.mark.parametrize("injected", [False, True])
+async def test_openai_chat_client_context_ownership(client_type, azure: bool, injected: bool) -> None:
+    from azure.core.credentials_async import AsyncTokenCredential
+
+    sdk_client = AsyncOpenAI(api_key="test-key") if injected else None
+    credential = MagicMock(spec=AsyncTokenCredential)
+    credential.close = AsyncMock()
+    kwargs: dict[str, Any] = {"async_client": sdk_client} if injected else {}
+    if azure:
+        kwargs.update(azure_endpoint="https://test.openai.azure.com", credential=credential)
+    else:
+        kwargs["api_key"] = "test-key"
+
+    client = client_type(model="test-model", **kwargs)
+    with patch.object(client.client, "close", wraps=client.client.close) as close:
+        async with client as entered:
+            assert entered is client
+            close.assert_not_awaited()
+        await client.close()
+        assert close.await_count == (0 if injected else 1)
+    assert client.client.is_closed() is not injected
+    credential.close.assert_not_awaited()
+    assert "_owns_client" not in client.to_dict()
+    assert "_client_closed" not in client.to_dict()
+    if sdk_client is not None:
+        await sdk_client.close()
 
 
 class _FakeAsyncEventStream:
@@ -109,7 +188,7 @@ class _FakeAsyncEventStream:
         self._iterator: Iterator[object] = iter(())
         self._headers = headers or {}
 
-    def __aiter__(self) -> "_FakeAsyncEventStream":
+    def __aiter__(self) -> _FakeAsyncEventStream:
         self._iterator = iter(self._events)
         return self
 
@@ -124,14 +203,14 @@ class _FakeAsyncEventStream:
     # ``.headers``. The chat client then ``async with``-s the parsed stream so the
     # underlying socket is closed deterministically. Mimic both interfaces here so
     # test mocks remain a single object.
-    def parse(self) -> "_FakeAsyncEventStream":
+    def parse(self) -> _FakeAsyncEventStream:
         return self
 
     @property
     def headers(self) -> dict[str, str]:
         return self._headers
 
-    async def __aenter__(self) -> "_FakeAsyncEventStream":
+    async def __aenter__(self) -> _FakeAsyncEventStream:
         return self
 
     async def __aexit__(
@@ -170,7 +249,7 @@ def _as_raw(mock_response: MagicMock, *, headers: dict[str, str] | None = None) 
 
 
 class _FakeAsyncEventStreamContext(_FakeAsyncEventStream):
-    async def __aenter__(self) -> "_FakeAsyncEventStreamContext":
+    async def __aenter__(self) -> _FakeAsyncEventStreamContext:
         return self
 
     async def __aexit__(
@@ -853,7 +932,7 @@ class _BareEventStream:
         self._items = list(items)
         self._iterator: Iterator[object] = iter(())
 
-    def __aiter__(self) -> "_BareEventStream":
+    def __aiter__(self) -> _BareEventStream:
         self._iterator = iter(self._items)
         return self
 
@@ -884,7 +963,7 @@ class _FakeTelemetryStreamWrapper:
     def __init__(self, stream_async_iter: Any) -> None:
         self.stream_async_iter: Any = stream_async_iter
 
-    def __aiter__(self) -> "_FakeTelemetryStreamWrapper":
+    def __aiter__(self) -> _FakeTelemetryStreamWrapper:
         self.stream_async_iter = self.stream_async_iter.__aiter__()
         return self
 
@@ -6713,6 +6792,23 @@ def test_prepare_tools_for_openai_with_mcp() -> None:
     assert "require_approval" in mcp
 
 
+def test_get_mcp_tool_merges_both_approval_lists() -> None:
+    """Both approval lists must survive: overwriting the first with the second would
+    silently auto-approve tools the caller asked to gate."""
+    tool_config = OpenAIChatClient.get_mcp_tool(
+        name="MCP",
+        url="https://mcp.example",
+        approval_mode={
+            "always_require_approval": ["dangerous_tool"],
+            "never_require_approval": ["safe_tool"],
+        },
+    )
+    assert tool_config["require_approval"] == {
+        "always": {"tool_names": ["dangerous_tool"]},
+        "never": {"tool_names": ["safe_tool"]},
+    }
+
+
 @pytest.mark.parametrize("allowed_tools", [None, [], ["read_only"]], ids=["omitted", "empty", "nonempty"])
 async def test_get_mcp_tool_preserves_allowed_tools_in_request(allowed_tools: list[str] | None) -> None:
     tool_config = OpenAIChatClient.get_mcp_tool(
@@ -7844,7 +7940,7 @@ async def test_streaming_azure_ai_search_output_enriches_mapped_agent_response()
         ),
     ]
 
-    async def _stream() -> AsyncGenerator[ChatResponseUpdate, None]:
+    async def _stream() -> AsyncGenerator[ChatResponseUpdate]:
         for update in updates:
             yield update
 

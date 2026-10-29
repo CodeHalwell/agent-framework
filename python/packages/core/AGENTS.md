@@ -67,7 +67,10 @@ agent_framework/
 ### Chat Clients (`_clients.py`)
 
 - **`SupportsChatGetResponse`** - Protocol for chat client implementations
-- **`BaseChatClient`** - Abstract base class with middleware support; subclasses implement `_inner_get_response()` and `_inner_get_streaming_response()`
+- **`BaseChatClient`** - Abstract base class without middleware; subclasses implement `_inner_get_response()`
+  for streaming and non-streaming requests. Provides `__aenter__()` returning `self`, `__aexit__()` delegating to
+  `close()`, and a default no-op async `close()`. Connectors override cleanup for owned connections and credentials;
+  injected resources remain caller-owned. `SupportsChatGetResponse` does not require lifecycle methods.
 
 ### Types (`_types.py`)
 
@@ -167,6 +170,25 @@ The vector store API is experimental under the shared `VECTOR_STORES` feature ID
   distance threshold.
   Shared serialization normalizes stored data; codecs and connector overrides remain trusted Python code
 - **`SupportsVectorUpsert`** / **`SupportsVectorSearch`** - Structural protocols for vector store capabilities
+
+### Compaction (`_compaction.py`)
+
+- **`AgentTriggeredCompactionStrategy`** - Wraps one existing compaction strategy and invokes it only after its
+  explicitly registered trigger tool completes in the latest message group. Trigger consumption is stored on the
+  completed trigger call occurrence rather than on the strategy instance so shared agents remain safe across
+  concurrent runs and composed trigger tools do not suppress each other. The trigger group
+  is temporarily excluded while the inner strategy runs, so it does not consume retention counts, then restored by
+  default; set `exclude_trigger=True` to remove a trigger-only group from the next model call. Mixed groups that
+  contain unrelated tool calls are always restored atomically. The agent-triggered compaction APIs are experimental
+  under the shared `AGENT_TRIGGERED_COMPACTION` feature ID and require client-managed history (`store=False` with no
+  service-managed conversation ID). Strategy wrappers and compositions must propagate the optional
+  `requires_client_managed_history` capability; `TokenBudgetComposedStrategy` does this for its nested strategies.
+- **`UnloadSkillsCompactionStrategy`** - Intended as an inner agent-triggered strategy. It supplies an
+  `unload_skill` trigger-tool factory that `AgentTriggeredCompactionStrategy` adopts automatically, then removes
+  complete `load_skill` and `read_skill_resource` groups for one named skill, or all skills when no name is
+  supplied. Loaded skill identity comes from successful result provenance recorded by `SkillsProvider` after
+  resolving the effective invocation, not the original model arguments. Groups with missing/invalid provenance,
+  unresolved calls, mixed tools, or `run_skill_script` results remain intact.
 
 ### Middleware (`_middleware.py`)
 
